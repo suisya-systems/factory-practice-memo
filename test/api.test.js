@@ -333,3 +333,106 @@ test("deleting the cursor's memo does not break paging", async () => {
   assert.deepEqual(p3.body.items.map((m) => m.id), ids.slice(2, 4));
   assert.equal(p3.body.nextCursor, null);
 });
+
+test('history records create, update and revert; revert restores content', async () => {
+  const m = (await req('POST', '/memos', { title: 'v1', body: 'one', tags: ['a'] })).body;
+  await req('PATCH', `/memos/${m.id}`, { title: 'v2', version: 1 });
+  await req('PUT', `/memos/${m.id}`, { title: 'v3', body: 'three', tags: ['c'], version: 2 });
+  // failed updates leave no trace
+  assert.equal((await req('PATCH', `/memos/${m.id}`, { title: 'x', version: 1 })).status, 409);
+  assert.equal((await req('PATCH', `/memos/${m.id}`, { title: '', version: 3 })).status, 400);
+
+  let r = await req('POST', `/memos/${m.id}/revert`, { toVersion: 1, version: 3 });
+  assert.equal(r.status, 200);
+  assert.deepEqual(Object.keys(r.body).sort(), ['body', 'createdAt', 'id', 'tags', 'title', 'updatedAt', 'version']);
+  assert.equal(r.body.title, 'v1');
+  assert.equal(r.body.body, 'one');
+  assert.deepEqual(r.body.tags, ['a']);
+  assert.equal(r.body.version, 4);
+  assert.equal(r.body.createdAt, m.createdAt);
+  assert.deepEqual((await req('GET', `/memos/${m.id}`)).body, r.body);
+
+  // reverting to a revert entry restores that entry's content
+  r = await req('POST', `/memos/${m.id}/revert`, { toVersion: 3, version: 4 });
+  assert.equal(r.body.title, 'v3');
+  r = await req('POST', `/memos/${m.id}/revert`, { toVersion: 4, version: 5 });
+  assert.equal(r.body.title, 'v1');
+  assert.equal(r.body.version, 6);
+
+  r = await req('GET', `/memos/${m.id}/history`);
+  assert.equal(r.status, 200);
+  assert.equal(r.body.nextCursor, null);
+  assert.deepEqual(r.body.items.map((e) => [e.version, e.action, e.revertedFrom, e.title]), [
+    [1, 'create', null, 'v1'],
+    [2, 'update', null, 'v2'],
+    [3, 'update', null, 'v3'],
+    [4, 'revert', 1, 'v1'],
+    [5, 'revert', 3, 'v3'],
+    [6, 'revert', 4, 'v1'],
+  ]);
+  assert.deepEqual(Object.keys(r.body.items[0]).sort(), ['action', 'body', 'revertedFrom', 'tags', 'title', 'updatedAt', 'version']);
+  assert.equal(r.body.items[5].updatedAt, (await req('GET', `/memos/${m.id}`)).body.updatedAt);
+});
+
+test('revert validation and conflicts', async () => {
+  const m = (await req('POST', '/memos', { title: 'a' })).body;
+  await req('PATCH', `/memos/${m.id}`, { title: 'b', version: 1 });
+  const u = `/memos/${m.id}/revert`;
+  for (const body of [{ version: 2 }, { toVersion: 0, version: 2 }, { toVersion: '1', version: 2 }, { toVersion: 1 }, { toVersion: 1, version: 0 }]) {
+    const r = await req('POST', u, body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.equal(typeof r.body.error, 'string');
+  }
+  let r = await req('POST', u, { toVersion: 1, version: 1 });
+  assert.equal(r.status, 409);
+  assert.equal(r.body.current.version, 2);
+  assert.equal((await req('POST', u, { toVersion: 2, version: 2 })).status, 400);
+  assert.equal((await req('POST', u, { toVersion: 9, version: 2 })).status, 404);
+  assert.equal((await req('POST', '/memos/nope/revert', { toVersion: 1, version: 1 })).status, 404);
+  assert.equal((await req('GET', `/memos/${m.id}`)).body.version, 2);
+  assert.equal((await req('GET', `/memos/${m.id}/history`)).body.items.length, 2);
+
+  r = await req('GET', u);
+  assert.equal(r.status, 405);
+  assert.equal(r.headers.get('allow'), 'POST');
+  r = await req('POST', `/memos/${m.id}/history`, {});
+  assert.equal(r.status, 405);
+  assert.equal(r.headers.get('allow'), 'GET');
+});
+
+test('concurrent revert and PATCH with the same version: one 200, one 409', async () => {
+  const m = (await req('POST', '/memos', { title: 'a' })).body;
+  await req('PATCH', `/memos/${m.id}`, { title: 'b', version: 1 });
+  const rs = await Promise.all([
+    req('POST', `/memos/${m.id}/revert`, { toVersion: 1, version: 2 }),
+    req('PATCH', `/memos/${m.id}`, { title: 'c', version: 2 }),
+    req('POST', `/memos/${m.id}/revert`, { toVersion: 1, version: 2 }),
+  ]);
+  assert.deepEqual(rs.map((r) => r.status).sort(), [200, 409, 409]);
+  const h = (await req('GET', `/memos/${m.id}/history`)).body.items;
+  assert.equal(h.length, 3);
+});
+
+test('history paging, invalid params, deleted memo', async () => {
+  const m = (await req('POST', '/memos', { title: 't0' })).body;
+  for (let v = 1; v <= 6; v++) await req('PATCH', `/memos/${m.id}`, { title: `t${v}`, version: v });
+  const seen = [];
+  let cursor = null;
+  do {
+    const r = await req('GET', `/memos/${m.id}/history?limit=3${cursor ? `&cursor=${cursor}` : ''}`);
+    assert.equal(r.status, 200);
+    seen.push(...r.body.items.map((e) => e.version));
+    cursor = r.body.nextCursor;
+  } while (cursor);
+  assert.deepEqual(seen, [1, 2, 3, 4, 5, 6, 7]);
+
+  const other = (await req('POST', '/memos', { title: 'o' })).body;
+  await req('PATCH', `/memos/${other.id}`, { title: 'o2', version: 1 });
+  const foreign = (await req('GET', `/memos/${other.id}/history?limit=1`)).body.nextCursor;
+  for (const q of ['limit=0', 'limit=101', 'limit=x', 'cursor=!!', `cursor=${foreign}`]) {
+    assert.equal((await req('GET', `/memos/${m.id}/history?${q}`)).status, 400, q);
+  }
+  assert.equal((await req('DELETE', `/memos/${m.id}`)).status, 204);
+  assert.equal((await req('GET', `/memos/${m.id}/history`)).status, 404);
+  assert.equal((await req('GET', '/memos/unknown/history')).status, 404);
+});

@@ -19,6 +19,8 @@ const memos = new Map();
 // Internal creation sequence numbers (never reused, not exposed).
 const seqs = new Map();
 let lastSeq = 0;
+// Per-memo change history: id -> array of entries, ascending by version.
+const histories = new Map();
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -170,15 +172,7 @@ function parseListQuery(params) {
   const q = params.get('q');
   const terms = q === null ? [] : q.toLowerCase().split(/\s+/).filter((t) => t !== '');
 
-  let limit = LIMIT_DEFAULT;
-  const rawLimit = params.get('limit');
-  if (rawLimit !== null) {
-    if (!/^[0-9]+$/.test(rawLimit)) throw new HttpError(400, '"limit" must be an integer');
-    limit = Number(rawLimit);
-    if (limit < LIMIT_MIN || limit > LIMIT_MAX) {
-      throw new HttpError(400, `"limit" must be between ${LIMIT_MIN} and ${LIMIT_MAX}`);
-    }
-  }
+  const limit = parseLimit(params);
 
   let after = 0;
   const cursor = params.get('cursor');
@@ -192,6 +186,81 @@ function parseListQuery(params) {
     after = Number(decoded);
   }
   return { tags, terms, limit, after };
+}
+
+function parseLimit(params) {
+  let limit = LIMIT_DEFAULT;
+  const rawLimit = params.get('limit');
+  if (rawLimit !== null) {
+    if (!/^[0-9]+$/.test(rawLimit)) throw new HttpError(400, '"limit" must be an integer');
+    limit = Number(rawLimit);
+    if (limit < LIMIT_MIN || limit > LIMIT_MAX) {
+      throw new HttpError(400, `"limit" must be between ${LIMIT_MIN} and ${LIMIT_MAX}`);
+    }
+  }
+  return limit;
+}
+
+function recordHistory(memo, action, revertedFrom = null) {
+  let list = histories.get(memo.id);
+  if (!list) {
+    list = [];
+    histories.set(memo.id, list);
+  }
+  list.push({
+    version: memo.version,
+    title: memo.title,
+    body: memo.body,
+    tags: [...memo.tags],
+    updatedAt: memo.updatedAt,
+    action,
+    revertedFrom,
+  });
+}
+
+// History cursor: base64url of "h:<memo id>:<last version on the page>".
+// Bound to the memo so a cursor from another memo or from GET /memos is rejected.
+function encodeHistoryCursor(id, version) {
+  return Buffer.from(`h:${id}:${version}`, 'utf8').toString('base64url');
+}
+
+function listHistory(id, params) {
+  getMemoOr404(id);
+  const limit = parseLimit(params);
+  let after = 0;
+  const cursor = params.get('cursor');
+  if (cursor !== null) {
+    const decoded = /^[A-Za-z0-9_-]+$/.test(cursor)
+      ? Buffer.from(cursor, 'base64url').toString('utf8')
+      : '';
+    const prefix = `h:${id}:`;
+    const rest = decoded.startsWith(prefix) ? decoded.slice(prefix.length) : '';
+    if (!/^[0-9]+$/.test(rest) || !Number.isSafeInteger(Number(rest))) {
+      throw new HttpError(400, 'Invalid "cursor"');
+    }
+    after = Number(rest);
+  }
+  const all = histories.get(id) ?? [];
+  // Entries are in ascending version order (oldest first).
+  const start = all.findIndex((e) => e.version > after);
+  const from = start === -1 ? all.length : start;
+  const items = all.slice(from, from + limit);
+  const hasMore = from + limit < all.length;
+  return {
+    items,
+    nextCursor: hasMore ? encodeHistoryCursor(id, items[items.length - 1].version) : null,
+  };
+}
+
+function parseRevert(input) {
+  if (!Object.prototype.hasOwnProperty.call(input, 'toVersion')) {
+    throw new HttpError(400, '"toVersion" is required');
+  }
+  const toVersion = input.toVersion;
+  if (!Number.isInteger(toVersion) || toVersion < 1) {
+    throw new HttpError(400, '"toVersion" must be a positive integer');
+  }
+  return { toVersion, version: validateVersion(input) };
 }
 
 function encodeCursor(seq) {
@@ -246,6 +315,7 @@ async function handle(req, res) {
       };
       memos.set(memo.id, memo);
       seqs.set(memo.id, ++lastSeq);
+      recordHistory(memo, 'create');
       return send(res, 201, memo);
     }
     res.setHeader('Allow', 'GET, POST');
@@ -265,6 +335,7 @@ async function handle(req, res) {
       getMemoOr404(id);
       memos.delete(id);
       seqs.delete(id);
+      histories.delete(id);
       return send(res, 204);
     }
     if (method === 'PATCH' || method === 'PUT') {
@@ -285,10 +356,57 @@ async function handle(req, res) {
       if (fields.tags !== undefined) memo.tags = fields.tags;
       memo.version += 1;
       memo.updatedAt = nowIso();
+      recordHistory(memo, 'update');
       return send(res, 200, memo);
     }
     res.setHeader('Allow', 'GET, PATCH, PUT, DELETE');
     throw new HttpError(405, `Method ${method} not allowed on /memos/:id`);
+  }
+
+  const sub = /^\/memos\/([^/]+)\/(history|revert)$/.exec(path);
+  if (sub) {
+    let id;
+    try {
+      id = decodeURIComponent(sub[1]);
+    } catch {
+      throw new HttpError(404, 'Memo not found');
+    }
+    if (sub[2] === 'history') {
+      if (method === 'GET') return send(res, 200, listHistory(id, url.searchParams));
+      res.setHeader('Allow', 'GET');
+      throw new HttpError(405, `Method ${method} not allowed on /memos/:id/history`);
+    }
+    if (method === 'POST') {
+      getMemoOr404(id);
+      const input = await readJson(req);
+      const { toVersion, version } = parseRevert(input);
+      // Synchronous from here on: the version compare-and-set is atomic, exactly
+      // like PATCH/PUT, so of two concurrent writers with the same version one
+      // wins and the other gets 409.
+      const memo = getMemoOr404(id);
+      if (version !== memo.version) {
+        return send(res, 409, {
+          error: `Version conflict: expected ${memo.version}, got ${version}`,
+          current: memo,
+        });
+      }
+      if (toVersion === memo.version) {
+        throw new HttpError(400, `"toVersion" ${toVersion} is already the current version`);
+      }
+      const target = (histories.get(id) ?? []).find((e) => e.version === toVersion);
+      if (!target) {
+        throw new HttpError(404, `Version ${toVersion} not found in history of memo ${id}`);
+      }
+      memo.title = target.title;
+      memo.body = target.body;
+      memo.tags = [...target.tags];
+      memo.version += 1;
+      memo.updatedAt = nowIso();
+      recordHistory(memo, 'revert', toVersion);
+      return send(res, 200, memo);
+    }
+    res.setHeader('Allow', 'POST');
+    throw new HttpError(405, `Method ${method} not allowed on /memos/:id/revert`);
   }
 
   throw new HttpError(404, `Route not found: ${method} ${url.pathname}`);
